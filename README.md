@@ -26,4 +26,37 @@ This repository contains the code, data, and models for the spectral clustering 
    cd Thesis
 
 2. Install dependencies:
-pip install -r requirements.txt
+    ```bash
+    pip install -r requirements.txt
+
+## Usage
+
+1. Extract Audio Segments: Run the extract_segments.py script to extract audio segments from raw recordings:
+    ```bash
+    python extract_segments.py
+
+2. Generate Spectrograms: Use the generate_spectrograms.py script to create spectrograms:
+    ```bash
+    python generate_spectrograms.py
+
+3. Train Autoencoder: Train the autoencoder model for feature extraction:
+    ```bash
+    python train_autoencoder.py
+
+4. Analyze Segments: Perform analysis on the extracted segments:
+    ```bash
+    python analyze_segments.py
+
+5. Verify Spectrograms: Check the quality of generated spectrograms:
+    ```bash
+    python verify_spectrograms.py
+
+## Data
+
+Raw Data: Located in 25108016/ and includes metadata and submissions.
+Processed Data: Extracted segments are stored in extracted_segments/.
+Spectrograms: Generated spectrograms are saved in spectrograms/.
+
+## Outputs
+Analysis Results: Found in data_analysis/, including visualizations and CSV files.
+Trained Models: Saved in models/, including the autoencoder and bottleneck features.
