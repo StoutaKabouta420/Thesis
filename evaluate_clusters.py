@@ -1,297 +1,286 @@
-#!/usr/bin/env python3
-"""
-Cluster Evaluation Tool for Underwater Bioacoustics
-Organizes audio segments and spectrograms by cluster for manual evaluation.
-"""
-
-import numpy as np
 import os
-import shutil
+import numpy as np
 import matplotlib.pyplot as plt
-import librosa
-import librosa.display
 from pathlib import Path
+import shutil
+from collections import defaultdict
 import pandas as pd
+from scipy.io import wavfile
 import argparse
-from datetime import datetime
-import random
+from tqdm import tqdm
 
 class ClusterEvaluator:
-    """
-    Tool for evaluating and organizing clustered bioacoustic data.
-    """
-    
-    def __init__(self, cluster_labels_path, extracted_segments_dir, 
-                 spectrograms_dir, output_dir):
+    def __init__(self, cluster_labels_path, extracted_segments_dir, spectrograms_dir, output_dir):
         """
         Initialize the cluster evaluator.
         
         Args:
-            cluster_labels_path (str): Path to cluster labels .npy file
-            extracted_segments_dir (str): Directory containing audio segments
-            spectrograms_dir (str): Directory containing spectrograms
-            output_dir (str): Output directory for organized results
+            cluster_labels_path: Path to the cluster labels .npy file
+            extracted_segments_dir: Directory containing extracted audio segments
+            spectrograms_dir: Directory containing spectrogram arrays
+            output_dir: Directory to save evaluation results
         """
         self.cluster_labels = np.load(cluster_labels_path)
         self.extracted_segments_dir = Path(extracted_segments_dir)
         self.spectrograms_dir = Path(spectrograms_dir)
         self.output_dir = Path(output_dir)
-        self.n_clusters = len(np.unique(self.cluster_labels))
-        
-        # Create output directory structure
-        self.setup_output_directories()
-        
-        # Get file lists
-        self.audio_files = self.get_audio_files()
-        self.spectrogram_files = self.get_spectrogram_files()
-        
-        print(f"Loaded {len(self.cluster_labels)} cluster labels")
-        print(f"Found {len(self.audio_files)} audio files")
-        print(f"Found {len(self.spectrogram_files)} spectrogram files")
-        print(f"Number of clusters: {self.n_clusters}")
-    
-    def setup_output_directories(self):
-        """Create organized directory structure for clusters."""
         self.output_dir.mkdir(exist_ok=True)
         
-        # Create cluster directories
-        for cluster_id in range(self.n_clusters):
-            cluster_dir = self.output_dir / f"cluster_{cluster_id}"
-            cluster_dir.mkdir(exist_ok=True)
-            (cluster_dir / "audio").mkdir(exist_ok=True)
-            (cluster_dir / "spectrograms").mkdir(exist_ok=True)
-            (cluster_dir / "sample_spectrograms").mkdir(exist_ok=True)
-    
-    def get_audio_files(self):
-        """Get list of audio files in extracted_segments directory."""
-        audio_extensions = ['.wav', '.mp3', '.flac', '.m4a']
+        # Load spectrogram data
+        self.spectrograms = np.load(self.spectrograms_dir / 'spectrograms_enhanced.npy')
+        self.frequencies = np.load(self.spectrograms_dir / 'frequencies.npy')
+        self.times = np.load(self.spectrograms_dir / 'times.npy')
+        
+        print(f"Loaded {len(self.cluster_labels)} cluster labels")
+        print(f"Loaded {len(self.spectrograms)} spectrograms")
+        
+        # Collect all audio files
+        self.audio_files = self._collect_audio_files()
+        print(f"Found {len(self.audio_files)} audio files")
+        
+        # Get unique clusters
+        self.unique_clusters = np.unique(self.cluster_labels)
+        self.n_clusters = len(self.unique_clusters)
+        print(f"Number of clusters: {self.n_clusters}")
+        
+    def _collect_audio_files(self):
+        """Collect all audio files from the extracted segments directory."""
         audio_files = []
         
-        for ext in audio_extensions:
-            audio_files.extend(list(self.extracted_segments_dir.glob(f"**/*{ext}")))
+        for recording_dir in self.extracted_segments_dir.iterdir():
+            if recording_dir.is_dir():
+                wav_files = list(recording_dir.glob("*.wav"))
+                audio_files.extend(wav_files)
         
-        return sorted(audio_files)
+        # Sort to ensure consistent ordering
+        audio_files.sort()
+        return audio_files
     
-    def get_spectrogram_files(self):
-        """Get list of spectrogram files."""
-        spectrogram_files = list(self.spectrograms_dir.glob("**/*.png"))
-        return sorted(spectrogram_files)
-    
-    def organize_files_by_cluster(self, copy_files=True):
+    def organize_by_cluster(self, copy_files=False):
         """
-        Organize audio files and spectrograms by cluster.
+        Organize files by cluster, creating directories and optionally copying files.
         
         Args:
-            copy_files (bool): Whether to copy files (True) or create symlinks (False)
+            copy_files: If True, copy files. If False, create symbolic links.
         """
-        print("Organizing files by cluster...")
+        print("\nOrganizing files by cluster...")
         
-        cluster_stats = {}
+        cluster_stats = []
         
-        for cluster_id in range(self.n_clusters):
+        for cluster_id in self.unique_clusters:
+            # Get indices for this cluster
             cluster_indices = np.where(self.cluster_labels == cluster_id)[0]
-            cluster_stats[cluster_id] = {
-                'count': len(cluster_indices),
-                'audio_files': [],
-                'spectrogram_files': []
-            }
             
+            # Create cluster directory
             cluster_dir = self.output_dir / f"cluster_{cluster_id}"
+            cluster_dir.mkdir(exist_ok=True)
             
-            print(f"Processing Cluster {cluster_id}: {len(cluster_indices)} samples")
+            # Create subdirectories
+            audio_dir = cluster_dir / "audio"
+            audio_dir.mkdir(exist_ok=True)
             
-            # Organize audio files
+            spectrograms_dir = cluster_dir / "spectrograms"
+            spectrograms_dir.mkdir(exist_ok=True)
+            
+            print(f"\nProcessing Cluster {cluster_id}: {len(cluster_indices)} samples")
+            
+            # Process files for this cluster
+            audio_count = 0
+            
             for idx in cluster_indices:
                 if idx < len(self.audio_files):
+                    # Handle audio file
                     src_audio = self.audio_files[idx]
-                    dst_audio = cluster_dir / "audio" / src_audio.name
+                    dst_audio = audio_dir / src_audio.name
                     
                     if copy_files:
                         shutil.copy2(src_audio, dst_audio)
                     else:
-                        if not dst_audio.exists():
-                            dst_audio.symlink_to(src_audio.absolute())
+                        if dst_audio.exists():
+                            dst_audio.unlink()
+                        dst_audio.symlink_to(src_audio.resolve())
                     
-                    cluster_stats[cluster_id]['audio_files'].append(src_audio.name)
-                
-                # Organize spectrogram files
-                if idx < len(self.spectrogram_files):
-                    src_spec = self.spectrogram_files[idx]
-                    dst_spec = cluster_dir / "spectrograms" / src_spec.name
+                    audio_count += 1
                     
-                    if copy_files:
-                        shutil.copy2(src_spec, dst_spec)
-                    else:
-                        if not dst_spec.exists():
-                            dst_spec.symlink_to(src_spec.absolute())
-                    
-                    cluster_stats[cluster_id]['spectrogram_files'].append(src_spec.name)
+                    # Save spectrogram as image
+                    if idx < len(self.spectrograms):
+                        spec_filename = spectrograms_dir / f"{src_audio.stem}_spectrogram.png"
+                        self._save_spectrogram_image(self.spectrograms[idx], spec_filename)
+            
+            # Store statistics
+            cluster_stats.append({
+                'cluster_id': cluster_id,
+                'sample_count': len(cluster_indices),
+                'percentage': len(cluster_indices) / len(self.cluster_labels) * 100,
+                'audio_files_count': audio_count
+            })
         
-        # Save cluster statistics
-        self.save_cluster_statistics(cluster_stats)
-        return cluster_stats
+        # Create summary statistics
+        stats_df = pd.DataFrame(cluster_stats)
+        stats_df.to_csv(self.output_dir / 'cluster_statistics.csv', index=False)
+        
+        print("\nCluster Statistics:")
+        print(stats_df.to_string(index=False))
+        
+        return stats_df
     
-    def create_cluster_summary_spectrograms(self, n_samples_per_cluster=5):
+    def _save_spectrogram_image(self, spectrogram, filename):
+        """Save a single spectrogram as an image."""
+        plt.figure(figsize=(10, 6))
+        
+        # Use the actual frequency and time arrays for proper scaling
+        plt.imshow(spectrogram, aspect='auto', origin='lower',
+                  extent=[self.times[0], self.times[-1], 
+                         self.frequencies[0], self.frequencies[-1]],
+                  cmap='viridis')
+        
+        plt.colorbar(label='Power (dB)')
+        plt.xlabel('Time (s)')
+        plt.ylabel('Frequency (Hz)')
+        plt.title(f'Spectrogram: {filename.stem}')
+        plt.tight_layout()
+        plt.savefig(filename, dpi=100, bbox_inches='tight')
+        plt.close()
+    
+    def create_cluster_summary_spectrograms(self, samples_per_cluster=5):
         """
         Create summary spectrograms showing representative samples from each cluster.
         
         Args:
-            n_samples_per_cluster (int): Number of sample spectrograms per cluster
+            samples_per_cluster: Number of samples to show per cluster
         """
-        print("Creating cluster summary spectrograms...")
+        print("\nCreating cluster summary spectrograms...")
         
-        for cluster_id in range(self.n_clusters):
+        for cluster_id in self.unique_clusters:
             cluster_indices = np.where(self.cluster_labels == cluster_id)[0]
             
-            # Randomly sample indices for this cluster
-            n_samples = min(n_samples_per_cluster, len(cluster_indices))
-            sampled_indices = random.sample(list(cluster_indices), n_samples)
+            # Select representative samples
+            if len(cluster_indices) > samples_per_cluster:
+                # Select evenly spaced samples
+                selected_indices = cluster_indices[::len(cluster_indices)//samples_per_cluster][:samples_per_cluster]
+            else:
+                selected_indices = cluster_indices
             
-            # Create subplot grid
+            # Create figure with subplots
+            n_samples = len(selected_indices)
             fig, axes = plt.subplots(1, n_samples, figsize=(4*n_samples, 4))
+            
             if n_samples == 1:
                 axes = [axes]
             
-            fig.suptitle(f'Cluster {cluster_id} - Representative Samples ({len(cluster_indices)} total)', 
-                        fontsize=16, fontweight='bold')
-            
-            for i, idx in enumerate(sampled_indices):
-                if idx < len(self.audio_files):
-                    audio_file = self.audio_files[idx]
+            for i, idx in enumerate(selected_indices):
+                if idx < len(self.spectrograms):
+                    spec = self.spectrograms[idx]
                     
-                    try:
-                        # Load audio and create spectrogram
-                        y, sr = librosa.load(audio_file, sr=None)
-                        
-                        # Create mel spectrogram
-                        S = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=128)
-                        S_dB = librosa.power_to_db(S, ref=np.max)
-                        
-                        # Plot spectrogram
-                        librosa.display.specshow(S_dB, sr=sr, x_axis='time', y_axis='mel',
-                                               ax=axes[i], cmap='viridis')
-                        axes[i].set_title(f'Sample {i+1}\n{audio_file.name}', fontsize=10)
-                        axes[i].set_xlabel('Time (s)')
-                        if i == 0:
-                            axes[i].set_ylabel('Mel Frequency')
-                        
-                    except Exception as e:
-                        axes[i].text(0.5, 0.5, f'Error loading\n{audio_file.name}\n{str(e)}', 
-                                   ha='center', va='center', transform=axes[i].transAxes)
-                        axes[i].set_title(f'Sample {i+1} - Error')
+                    im = axes[i].imshow(spec, aspect='auto', origin='lower',
+                                       extent=[self.times[0], self.times[-1],
+                                              self.frequencies[0], self.frequencies[-1]],
+                                       cmap='viridis')
+                    
+                    if idx < len(self.audio_files):
+                        axes[i].set_title(f'{self.audio_files[idx].stem[:20]}...')
+                    
+                    axes[i].set_xlabel('Time (s)')
+                    if i == 0:
+                        axes[i].set_ylabel('Frequency (Hz)')
             
+            plt.suptitle(f'Cluster {cluster_id} - Representative Samples ({len(cluster_indices)} total)')
             plt.tight_layout()
             
-            # Save summary plot
-            summary_path = self.output_dir / f"cluster_{cluster_id}" / "sample_spectrograms" / "cluster_summary.png"
-            plt.savefig(summary_path, dpi=300, bbox_inches='tight')
+            # Save
+            summary_path = self.output_dir / f'cluster_{cluster_id}_summary.png'
+            plt.savefig(summary_path, dpi=150, bbox_inches='tight')
             plt.close()
+            
+            print(f"Saved summary for Cluster {cluster_id}")
     
     def create_cluster_comparison_plot(self):
-        """Create a comparison plot showing one sample from each cluster."""
-        print("Creating cluster comparison plot...")
+        """Create a single plot comparing one representative sample from each cluster."""
+        print("\nCreating cluster comparison plot...")
         
-        fig, axes = plt.subplots(1, self.n_clusters, figsize=(4*self.n_clusters, 4))
-        if self.n_clusters == 1:
+        n_clusters = len(self.unique_clusters)
+        fig, axes = plt.subplots(1, n_clusters, figsize=(4*n_clusters, 4))
+        
+        if n_clusters == 1:
             axes = [axes]
         
-        fig.suptitle('Cluster Comparison - One Representative Sample per Cluster', 
-                    fontsize=16, fontweight='bold')
-        
-        for cluster_id in range(self.n_clusters):
+        for i, cluster_id in enumerate(self.unique_clusters):
+            # Get middle sample from cluster
             cluster_indices = np.where(self.cluster_labels == cluster_id)[0]
             
             if len(cluster_indices) > 0:
-                # Take first sample from cluster
-                sample_idx = cluster_indices[0]
+                # Pick middle sample
+                middle_idx = cluster_indices[len(cluster_indices)//2]
                 
-                if sample_idx < len(self.audio_files):
-                    audio_file = self.audio_files[sample_idx]
+                if middle_idx < len(self.spectrograms):
+                    spec = self.spectrograms[middle_idx]
                     
-                    try:
-                        # Load audio and create spectrogram
-                        y, sr = librosa.load(audio_file, sr=None)
-                        S = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=128)
-                        S_dB = librosa.power_to_db(S, ref=np.max)
-                        
-                        # Plot spectrogram
-                        librosa.display.specshow(S_dB, sr=sr, x_axis='time', y_axis='mel',
-                                               ax=axes[cluster_id], cmap='viridis')
-                        axes[cluster_id].set_title(f'Cluster {cluster_id}\n({len(cluster_indices)} samples)', 
-                                                  fontsize=12, fontweight='bold')
-                        axes[cluster_id].set_xlabel('Time (s)')
-                        if cluster_id == 0:
-                            axes[cluster_id].set_ylabel('Mel Frequency')
-                        
-                    except Exception as e:
-                        axes[cluster_id].text(0.5, 0.5, f'Error loading\nCluster {cluster_id}', 
-                                            ha='center', va='center', transform=axes[cluster_id].transAxes)
+                    im = axes[i].imshow(spec, aspect='auto', origin='lower',
+                                       extent=[self.times[0], self.times[-1],
+                                              self.frequencies[0], self.frequencies[-1]],
+                                       cmap='viridis', vmin=-80, vmax=-20)
+                    
+                    axes[i].set_title(f'Cluster {cluster_id}\n({len(cluster_indices)} samples)')
+                    axes[i].set_xlabel('Time (s)')
+                    
+                    if i == 0:
+                        axes[i].set_ylabel('Frequency (Hz)')
         
+        plt.suptitle('Cluster Comparison - One Representative Sample per Cluster', fontsize=14)
         plt.tight_layout()
         
-        # Save comparison plot
-        comparison_path = self.output_dir / "cluster_comparison.png"
-        plt.savefig(comparison_path, dpi=300, bbox_inches='tight')
+        comparison_path = self.output_dir / 'cluster_comparison.png'
+        plt.savefig(comparison_path, dpi=150, bbox_inches='tight')
         plt.close()
         
         print(f"Cluster comparison plot saved to: {comparison_path}")
     
-    def save_cluster_statistics(self, cluster_stats):
-        """Save cluster statistics to CSV file."""
-        stats_data = []
+    def create_playlists(self, max_files_per_playlist=50):
+        """
+        Create .m3u playlist files for each cluster.
         
-        for cluster_id, stats in cluster_stats.items():
-            stats_data.append({
-                'cluster_id': cluster_id,
-                'sample_count': stats['count'],
-                'percentage': (stats['count'] / len(self.cluster_labels)) * 100,
-                'audio_files_count': len(stats['audio_files']),
-                'spectrogram_files_count': len(stats['spectrogram_files'])
-            })
+        Args:
+            max_files_per_playlist: Maximum number of files to include in each playlist
+        """
+        print("\nCreating playlist files...")
         
-        df = pd.DataFrame(stats_data)
-        stats_path = self.output_dir / "cluster_statistics.csv"
-        df.to_csv(stats_path, index=False)
-        
-        print(f"\nCluster Statistics:")
-        print(df.to_string(index=False))
-        print(f"\nStatistics saved to: {stats_path}")
-    
-    def create_playlist_files(self):
-        """Create M3U playlist files for each cluster for easy audio playback."""
-        print("Creating playlist files...")
-        
-        for cluster_id in range(self.n_clusters):
-            cluster_dir = self.output_dir / f"cluster_{cluster_id}"
-            audio_dir = cluster_dir / "audio"
+        for cluster_id in self.unique_clusters:
+            cluster_indices = np.where(self.cluster_labels == cluster_id)[0]
             
-            # Get all audio files in this cluster
-            audio_files = list(audio_dir.glob("*.*"))
+            # Create playlist
+            playlist_path = self.output_dir / f'cluster_{cluster_id}_samples.m3u'
             
-            if audio_files:
-                playlist_path = cluster_dir / f"cluster_{cluster_id}_playlist.m3u"
+            with open(playlist_path, 'w') as f:
+                f.write('#EXTM3U\n')
                 
-                with open(playlist_path, 'w') as f:
-                    f.write("#EXTM3U\n")
-                    for audio_file in sorted(audio_files):
-                        f.write(f"audio/{audio_file.name}\n")
-                
-                print(f"Created playlist for Cluster {cluster_id}: {len(audio_files)} files")
+                count = 0
+                for idx in cluster_indices:
+                    if idx < len(self.audio_files) and count < max_files_per_playlist:
+                        audio_file = self.audio_files[idx]
+                        f.write(f'#EXTINF:-1,{audio_file.stem}\n')
+                        f.write(f'{audio_file.resolve()}\n')
+                        count += 1
+            
+            print(f"Created playlist for Cluster {cluster_id}: {count} files")
 
 def main():
-    parser = argparse.ArgumentParser(description='Evaluate and organize clustered bioacoustic data')
+    parser = argparse.ArgumentParser(description='Evaluate clustering results for underwater bioacoustics')
+    
     parser.add_argument('--cluster_labels', type=str, required=True,
                        help='Path to cluster labels .npy file')
-    parser.add_argument('--extracted_segments', type=str, default='extracted_segments',
+    parser.add_argument('--extracted_segments', type=str, 
+                       default='extracted_segments',
                        help='Directory containing extracted audio segments')
-    parser.add_argument('--spectrograms', type=str, default='spectrograms',
-                       help='Directory containing spectrograms')
-    parser.add_argument('--output_dir', type=str, default='cluster_evaluation',
-                       help='Output directory for organized results')
+    parser.add_argument('--spectrograms', type=str, 
+                       default='spectrograms_optimized',  # Updated default
+                       help='Directory containing spectrogram arrays')
+    parser.add_argument('--output_dir', type=str, 
+                       default='cluster_evaluation',
+                       help='Output directory for evaluation results')
     parser.add_argument('--copy_files', action='store_true',
-                       help='Copy files instead of creating symlinks')
+                       help='Copy files instead of creating symbolic links')
     parser.add_argument('--samples_per_cluster', type=int, default=5,
-                       help='Number of sample spectrograms per cluster')
+                       help='Number of sample spectrograms to show per cluster')
     
     args = parser.parse_args()
     
@@ -308,25 +297,26 @@ def main():
     )
     
     # Organize files by cluster
-    cluster_stats = evaluator.organize_files_by_cluster(copy_files=args.copy_files)
+    stats_df = evaluator.organize_by_cluster(copy_files=args.copy_files)
+    print(f"\nStatistics saved to: {evaluator.output_dir / 'cluster_statistics.csv'}")
     
-    # Create summary visualizations
-    evaluator.create_cluster_summary_spectrograms(n_samples_per_cluster=args.samples_per_cluster)
+    # Create visualizations
+    evaluator.create_cluster_summary_spectrograms(samples_per_cluster=args.samples_per_cluster)
     evaluator.create_cluster_comparison_plot()
     
-    # Create playlist files for easy listening
-    evaluator.create_playlist_files()
+    # Create playlists
+    evaluator.create_playlists()
     
-    print(f"\n" + "="*60)
+    print("\n" + "=" * 60)
     print("EVALUATION COMPLETE!")
-    print(f"Results organized in: {args.output_dir}")
+    print(f"Results organized in: {evaluator.output_dir}")
     print(f"Found {evaluator.n_clusters} clusters")
     print("\nNext steps:")
     print("1. Open cluster_comparison.png to see overview of all clusters")
     print("2. Navigate to each cluster_X folder to examine samples")
     print("3. Use the .m3u playlist files to listen to audio samples")
     print("4. Check cluster_statistics.csv for detailed statistics")
-    print("="*60)
+    print("=" * 60)
 
 if __name__ == "__main__":
     main()
