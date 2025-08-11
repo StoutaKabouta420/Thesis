@@ -3,153 +3,193 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy.io import wavfile
 from scipy import signal
+from scipy.ndimage import median_filter, gaussian_filter
 from pathlib import Path
 import json
 from tqdm import tqdm
 import warnings
+
 warnings.filterwarnings('ignore')
 
-# Set up paths
 BASE_DIR = Path("/home/jakelove/Documents/2025/Thesis")
-SEGMENTS_DIR = BASE_DIR / "extracted_segments"
-SPECTROGRAM_DIR = BASE_DIR / "spectrograms_optimized"
+SEGMENTS_DIR = BASE_DIR / "extracted_segments_padded"  # Use padded segments
+SPECTROGRAM_DIR = BASE_DIR / "spectrograms_focused"
 SPECTROGRAM_DIR.mkdir(exist_ok=True)
 
-# Optimized parameters for whale bioacoustics
-PARAMS = {
-    'nfft': 1024,           # Balance between frequency and time resolution
-    'hop_length': 64,       # Much smaller hop for better time resolution (~94% overlap)
-    'window': 'hann',       # Window function
-    'target_duration': 0.5, # Target duration in seconds
-    'freq_min': 10,         # Lower min to capture fundamental frequencies
-    'freq_max': 600,        # Slightly higher max to see harmonics
-    'pre_emphasis': 0.0,    # No pre-emphasis initially - whale calls are low frequency
-    'ref_db': 1.0,          # Reference for dB calculation
-    'min_db': -100,         # Wider dynamic range
-    'max_db': 0,            # Maximum dB to display
-    'normalize_audio': True, # Normalize each segment
-    'apply_bandpass': False, # Don't filter initially - see what's there
+# Based on the paper's analysis, Bryde's whale calls are primarily in 0-500 Hz range
+# with key components around 42 Hz, 75 Hz, and 105 Hz
+SPECTROGRAM_CONFIG = {
+    'sample_rate': 8000,      # Target sample rate
+    'nfft': 4096,             # FFT size from paper
+    'overlap': 0.95,          # 95% overlap from paper
+    'freq_min': 0,            # Start from 0 Hz
+    'freq_max': 500,          # Up to 500 Hz
+    'target_shape': (129, 64), # Fixed output shape (freq_bins, time_bins)
+    'window': 'hann',         # Window type
+    'min_duration': 0.5,      # Minimum segment duration to process
 }
 
-def normalize_audio(audio_data):
-    """Normalize audio to [-1, 1] range while preserving dynamics."""
-    # Remove DC offset first
-    audio_data = audio_data - np.mean(audio_data)
-    
-    # Find the maximum absolute value
-    max_val = np.max(np.abs(audio_data))
-    
-    if max_val > 0:
-        # Normalize to [-0.9, 0.9] to avoid clipping
-        return 0.9 * audio_data / max_val
-    return audio_data
+# Enhancement parameters tuned for whale calls
+ENHANCEMENT_PARAMS = {
+    'noise_floor_percentile': 10,    # Percentile for noise estimation
+    'contrast_low_percentile': 10,   # Low percentile for contrast stretch
+    'contrast_high_percentile': 95,  # High percentile for contrast stretch
+    'median_filter_size': (3, 3),    # Median filter kernel size
+    'gaussian_sigma': 0.5,            # Gaussian smoothing sigma
+}
 
-def compute_spectrogram_scipy(audio_data, sample_rate, params):
+def load_and_preprocess_audio(wav_path, target_sr=8000):
     """
-    Create spectrogram using scipy with better parameters for whale calls.
+    Load and preprocess audio file.
     """
-    # Compute spectrogram
-    frequencies, times, Sxx = signal.spectrogram(
+    # Read audio
+    sample_rate, audio_data = wavfile.read(wav_path)
+    
+    # Convert to float32
+    if audio_data.dtype == np.int16:
+        audio_data = audio_data.astype(np.float32) / 32768.0
+    elif audio_data.dtype == np.int32:
+        audio_data = audio_data.astype(np.float32) / 2147483648.0
+    else:
+        audio_data = audio_data.astype(np.float32)
+    
+    # Resample if needed
+    if sample_rate != target_sr:
+        # Calculate new length
+        new_length = int(len(audio_data) * target_sr / sample_rate)
+        audio_data = signal.resample(audio_data, new_length)
+        sample_rate = target_sr
+    
+    # Normalize
+    audio_data = audio_data - np.mean(audio_data)
+    max_val = np.max(np.abs(audio_data))
+    if max_val > 0:
+        audio_data = 0.95 * audio_data / max_val
+    
+    return audio_data, sample_rate
+
+def compute_high_quality_spectrogram(audio_data, sample_rate, config):
+    """
+    Compute high-quality spectrogram similar to Raven Pro.
+    """
+    nfft = config['nfft']
+    overlap_samples = int(nfft * config['overlap'])
+    hop_length = nfft - overlap_samples
+    
+    # Ensure audio is long enough
+    if len(audio_data) < nfft:
+        # Pad with zeros
+        audio_data = np.pad(audio_data, (0, nfft - len(audio_data)), mode='constant')
+    
+    # Compute spectrogram using Hann window
+    window = signal.windows.hann(nfft, sym=False)
+    
+    freqs, times, Sxx = signal.spectrogram(
         audio_data,
         fs=sample_rate,
-        window=signal.get_window(params['window'], params['nfft']),
-        nperseg=params['nfft'],
-        noverlap=params['nfft'] - params['hop_length'],
+        window=window,
+        nperseg=nfft,
+        noverlap=overlap_samples,
+        detrend='constant',
         scaling='density',
-        mode='magnitude'
+        mode='psd'
     )
     
-    # Convert to power and then dB
-    Sxx_power = Sxx ** 2
+    # Convert to dB scale
+    Sxx_db = 10 * np.log10(Sxx + 1e-10)
     
-    # Use a more appropriate reference for underwater acoustics
-    # 1 µPa is standard reference for underwater sound
-    Sxx_db = 10 * np.log10(Sxx_power / params['ref_db'] + 1e-10)
+    # Extract frequency range of interest
+    freq_mask = (freqs >= config['freq_min']) & (freqs <= config['freq_max'])
+    Sxx_db = Sxx_db[freq_mask, :]
+    freqs = freqs[freq_mask]
     
-    return frequencies, times, Sxx_db
+    return freqs, times, Sxx_db
 
-def adaptive_denoise(spec_db, noise_floor_percentile=10):
+def enhance_spectrogram(spec_db, params):
     """
-    Adaptive denoising based on estimated noise floor.
+    Enhance spectrogram for better visualization and feature extraction.
     """
-    # Estimate noise floor from lower percentile of each frequency bin
-    noise_floor = np.percentile(spec_db, noise_floor_percentile, axis=1, keepdims=True)
-    
-    # Subtract noise floor (spectral subtraction)
+    # Step 1: Estimate and remove noise floor
+    noise_floor = np.percentile(spec_db, params['noise_floor_percentile'])
     spec_denoised = spec_db - noise_floor
     
-    # Set negative values to minimum
-    spec_denoised[spec_denoised < 0] = 0
+    # Step 2: Apply median filter to reduce speckle noise
+    spec_filtered = median_filter(spec_denoised, size=params['median_filter_size'])
     
-    return spec_denoised
+    # Step 3: Apply gentle Gaussian smoothing
+    spec_smoothed = gaussian_filter(spec_filtered, sigma=params['gaussian_sigma'])
+    
+    # Step 4: Contrast stretching
+    vmin = np.percentile(spec_smoothed, params['contrast_low_percentile'])
+    vmax = np.percentile(spec_smoothed, params['contrast_high_percentile'])
+    
+    # Clip and normalize
+    spec_stretched = np.clip(spec_smoothed, vmin, vmax)
+    spec_normalized = (spec_stretched - vmin) / (vmax - vmin + 1e-10)
+    
+    # Step 5: Apply gamma correction for better contrast
+    gamma = 0.7  # Emphasize mid-range values
+    spec_enhanced = np.power(spec_normalized, gamma)
+    
+    # Scale back to dB-like range for consistency
+    spec_final = spec_enhanced * 60 - 60  # Map to roughly -60 to 0 dB
+    
+    return spec_final
 
-def enhance_contrast(spec_db, method='percentile'):
+def resize_to_fixed_shape(spectrogram, target_shape):
     """
-    Enhance contrast using various methods.
+    Resize spectrogram to fixed shape using interpolation.
     """
-    if method == 'percentile':
-        # Use percentile scaling for better contrast
-        vmin = np.percentile(spec_db, 5)
-        vmax = np.percentile(spec_db, 95)
-        
-        # Clip and scale
-        spec_scaled = np.clip(spec_db, vmin, vmax)
-        spec_scaled = (spec_scaled - vmin) / (vmax - vmin)
-        
-        # Apply mild gamma correction
-        spec_enhanced = np.power(spec_scaled, 0.8)
-        
-        # Scale back to dB range
-        return spec_enhanced * (vmax - vmin) + vmin
+    from scipy.ndimage import zoom
     
-    return spec_db
+    if spectrogram.shape == target_shape:
+        return spectrogram
+    
+    # Calculate zoom factors
+    zoom_factors = (
+        target_shape[0] / spectrogram.shape[0],
+        target_shape[1] / spectrogram.shape[1]
+    )
+    
+    # Use bilinear interpolation
+    resized = zoom(spectrogram, zoom_factors, order=1)
+    
+    return resized
 
-def create_multi_resolution_spectrogram(audio_data, sample_rate):
+def visualize_spectrogram(spec, freqs, times, title="Spectrogram"):
     """
-    Create spectrograms at multiple resolutions for comparison.
+    Create a high-quality visualization of the spectrogram.
     """
-    resolutions = [
-        {'nfft': 512, 'hop': 32, 'name': 'high_time_res'},
-        {'nfft': 1024, 'hop': 64, 'name': 'balanced'},
-        {'nfft': 2048, 'hop': 128, 'name': 'high_freq_res'}
-    ]
+    fig, ax = plt.subplots(figsize=(10, 6))
     
-    results = {}
+    # Create extent for proper axis labels
+    extent = [times[0], times[-1], freqs[0], freqs[-1]]
     
-    for res in resolutions:
-        f, t, s = signal.spectrogram(
-            audio_data,
-            fs=sample_rate,
-            nperseg=res['nfft'],
-            noverlap=res['nfft'] - res['hop'],
-            scaling='density'
-        )
-        
-        s_db = 10 * np.log10(s + 1e-10)
-        results[res['name']] = {'freqs': f, 'times': t, 'spec': s_db}
+    # Plot spectrogram
+    im = ax.imshow(
+        spec,
+        aspect='auto',
+        origin='lower',
+        extent=extent,
+        cmap='hot',
+        interpolation='bilinear'
+    )
     
-    return results
-
-def pad_audio_centered(audio_data, sample_rate, target_duration):
-    """Pad audio to target duration, centering the signal."""
-    target_samples = int(target_duration * sample_rate)
-    current_samples = len(audio_data)
+    ax.set_xlabel('Time (s)')
+    ax.set_ylabel('Frequency (Hz)')
+    ax.set_title(title)
     
-    if current_samples >= target_samples:
-        # Center crop if longer
-        excess = current_samples - target_samples
-        start = excess // 2
-        return audio_data[start:start + target_samples]
-    else:
-        # Pad with zeros, centering the signal
-        pad_amount = target_samples - current_samples
-        pad_left = pad_amount // 2
-        pad_right = pad_amount - pad_left
-        return np.pad(audio_data, (pad_left, pad_right), mode='constant')
+    # Add colorbar
+    cbar = plt.colorbar(im, ax=ax)
+    cbar.set_label('Power (dB)')
+    
+    return fig
 
 def process_all_segments():
-    """Process all segments with optimized spectrograms."""
-    # Collect all segment files
+    """
+    Process all segments to create high-quality spectrograms.
+    """
+    # Find all segments
     all_segments = []
     for recording_folder in SEGMENTS_DIR.iterdir():
         if recording_folder.is_dir():
@@ -163,208 +203,177 @@ def process_all_segments():
     
     print(f"Found {len(all_segments)} segments to process")
     
-    # Store metadata
-    metadata = {
-        'params': PARAMS,
-        'segments': [],
-        'processing_info': {
-            'normalization': 'Peak normalization to ±0.9',
-            'denoising': 'Adaptive spectral subtraction',
-            'contrast': 'Percentile-based enhancement'
-        }
-    }
-    
-    # Process each segment
-    spectrograms = []
-    spectrograms_denoised = []
+    # Storage for results
+    spectrograms_original = []
     spectrograms_enhanced = []
     labels = []
+    metadata = []
     
-    # Analyze a few segments first to understand the data
-    print("\nAnalyzing first few segments to determine optimal parameters...")
+    processed_count = 0
+    skipped_count = 0
     
     for idx, segment_info in enumerate(tqdm(all_segments, desc="Processing segments")):
         try:
-            # Read audio
-            sample_rate, audio_data = wavfile.read(segment_info['path'])
+            # Load audio
+            audio_data, sample_rate = load_and_preprocess_audio(
+                segment_info['path'], 
+                SPECTROGRAM_CONFIG['sample_rate']
+            )
             
-            # Convert to float
-            if audio_data.dtype == np.int16:
-                audio_data = audio_data / 32768.0
-            elif audio_data.dtype == np.int32:
-                audio_data = audio_data / 2147483648.0
+            # Check duration
+            duration = len(audio_data) / sample_rate
+            if duration < SPECTROGRAM_CONFIG['min_duration']:
+                skipped_count += 1
+                continue
             
-            # Normalize if requested
-            if PARAMS['normalize_audio']:
-                audio_data = normalize_audio(audio_data)
+            # Compute spectrogram
+            freqs, times, spec_db = compute_high_quality_spectrogram(
+                audio_data, sample_rate, SPECTROGRAM_CONFIG
+            )
             
-            # Pad audio
-            audio_padded = pad_audio_centered(audio_data, sample_rate, PARAMS['target_duration'])
+            # Create original version (just normalized)
+            spec_original = resize_to_fixed_shape(spec_db, SPECTROGRAM_CONFIG['target_shape'])
             
-            # Create spectrogram
-            freqs, times, spec_db = compute_spectrogram_scipy(audio_padded, sample_rate, PARAMS)
-            
-            # Apply denoising
-            spec_denoised = adaptive_denoise(spec_db)
-            
-            # Enhance contrast
-            spec_enhanced = enhance_contrast(spec_denoised)
-            
-            # Limit frequency range
-            freq_mask = (freqs >= PARAMS['freq_min']) & (freqs <= PARAMS['freq_max'])
-            spec_filtered = spec_db[freq_mask, :]
-            spec_denoised_filtered = spec_denoised[freq_mask, :]
-            spec_enhanced_filtered = spec_enhanced[freq_mask, :]
-            freqs_filtered = freqs[freq_mask]
+            # Create enhanced version
+            spec_enhanced_full = enhance_spectrogram(spec_db, ENHANCEMENT_PARAMS)
+            spec_enhanced = resize_to_fixed_shape(spec_enhanced_full, SPECTROGRAM_CONFIG['target_shape'])
             
             # Store results
-            spectrograms.append(spec_filtered)
-            spectrograms_denoised.append(spec_denoised_filtered)
-            spectrograms_enhanced.append(spec_enhanced_filtered)
+            spectrograms_original.append(spec_original)
+            spectrograms_enhanced.append(spec_enhanced)
             labels.append(segment_info['recording'])
             
             # Store metadata
-            metadata['segments'].append({
-                'index': idx,
+            metadata.append({
                 'filename': segment_info['filename'],
                 'recording': segment_info['recording'],
-                'original_duration': len(audio_data) / sample_rate,
-                'sample_rate': sample_rate,
-                'shape': spec_filtered.shape,
-                'time_bins': len(times),
-                'freq_bins': len(freqs_filtered),
-                'max_power': float(np.max(spec_db)),
-                'mean_power': float(np.mean(spec_db))
+                'duration': float(duration),
+                'index': processed_count,
+                'freq_range': [float(freqs[0]), float(freqs[-1])],
+                'time_range': [float(times[0]), float(times[-1])]
             })
             
-            # Save detailed examples for first few segments
-            if idx < 5:
-                # Create comprehensive visualization
-                fig = plt.figure(figsize=(16, 12))
-                
-                # Original waveform
-                ax1 = plt.subplot(4, 2, 1)
-                time_audio = np.arange(len(audio_padded)) / sample_rate
-                ax1.plot(time_audio, audio_padded)
-                ax1.set_title('Waveform')
-                ax1.set_xlabel('Time (s)')
-                ax1.set_ylabel('Amplitude')
-                
-                # Multi-resolution spectrograms
-                multi_res = create_multi_resolution_spectrogram(audio_padded, sample_rate)
-                
-                for i, (res_name, res_data) in enumerate(multi_res.items()):
-                    ax = plt.subplot(4, 2, 2 + i)
-                    
-                    # Limit frequency range for display
-                    f_mask = (res_data['freqs'] <= PARAMS['freq_max'])
-                    
-                    im = ax.imshow(res_data['spec'][f_mask, :], 
-                                 aspect='auto', origin='lower',
-                                 extent=[res_data['times'][0], res_data['times'][-1], 
-                                        res_data['freqs'][f_mask][0], res_data['freqs'][f_mask][-1]],
-                                 cmap='viridis', vmin=-100, vmax=-20)
-                    ax.set_title(f'Spectrogram - {res_name}')
-                    ax.set_xlabel('Time (s)')
-                    ax.set_ylabel('Frequency (Hz)')
-                    plt.colorbar(im, ax=ax, label='dB')
-                
-                # Original spectrogram
-                ax5 = plt.subplot(4, 2, 5)
-                im5 = ax5.imshow(spec_filtered, aspect='auto', origin='lower',
-                               extent=[times[0], times[-1], freqs_filtered[0], freqs_filtered[-1]],
-                               cmap='viridis')
-                ax5.set_title('Original Spectrogram')
-                ax5.set_xlabel('Time (s)')
-                ax5.set_ylabel('Frequency (Hz)')
-                plt.colorbar(im5, ax=ax5, label='dB')
-                
-                # Denoised spectrogram
-                ax6 = plt.subplot(4, 2, 6)
-                im6 = ax6.imshow(spec_denoised_filtered, aspect='auto', origin='lower',
-                               extent=[times[0], times[-1], freqs_filtered[0], freqs_filtered[-1]],
-                               cmap='viridis')
-                ax6.set_title('Denoised Spectrogram')
-                ax6.set_xlabel('Time (s)')
-                ax6.set_ylabel('Frequency (Hz)')
-                plt.colorbar(im6, ax=ax6, label='dB')
-                
-                # Enhanced spectrogram
-                ax7 = plt.subplot(4, 2, 7)
-                im7 = ax7.imshow(spec_enhanced_filtered, aspect='auto', origin='lower',
-                               extent=[times[0], times[-1], freqs_filtered[0], freqs_filtered[-1]],
-                               cmap='viridis')
-                ax7.set_title('Enhanced Spectrogram')
-                ax7.set_xlabel('Time (s)')
-                ax7.set_ylabel('Frequency (Hz)')
-                plt.colorbar(im7, ax=ax7, label='dB')
-                
-                # Power spectrum (average across time)
-                ax8 = plt.subplot(4, 2, 8)
-                mean_spectrum = np.mean(spec_denoised_filtered, axis=1)
-                ax8.plot(freqs_filtered, mean_spectrum)
-                ax8.set_title('Average Power Spectrum')
-                ax8.set_xlabel('Frequency (Hz)')
-                ax8.set_ylabel('Power (dB)')
-                ax8.grid(True)
-                
-                plt.suptitle(f'Comprehensive Analysis: {segment_info["filename"]}')
-                plt.tight_layout()
-                
-                # Save
-                examples_dir = SPECTROGRAM_DIR / "detailed_examples"
-                examples_dir.mkdir(exist_ok=True)
-                plt.savefig(examples_dir / f'detailed_analysis_{idx:04d}.png', dpi=150)
-                plt.close()
-                
+            processed_count += 1
+            
+            # Save example visualizations for first few
+            if processed_count <= 10:
+                save_example_comparison(
+                    spec_original, spec_enhanced, 
+                    freqs, times,
+                    segment_info['filename'], 
+                    processed_count
+                )
+            
         except Exception as e:
             print(f"\nError processing {segment_info['filename']}: {e}")
+            skipped_count += 1
             continue
     
-    # Convert to arrays
-    spectrograms = np.array(spectrograms)
-    spectrograms_denoised = np.array(spectrograms_denoised)
-    spectrograms_enhanced = np.array(spectrograms_enhanced)
-    labels = np.array(labels)
+    print(f"\nProcessed {processed_count} segments, skipped {skipped_count}")
     
-    print(f"\nSuccessfully processed {len(spectrograms)} spectrograms")
-    print(f"Spectrogram shape: {spectrograms[0].shape if len(spectrograms) > 0 else 'N/A'}")
-    print(f"Time resolution: {times[1] - times[0]:.4f} seconds")
-    print(f"Frequency resolution: {freqs[1] - freqs[0]:.2f} Hz")
-    print(f"Dataset shape: {spectrograms.shape}")
+    if processed_count > 0:
+        # Convert to numpy arrays
+        spectrograms_original = np.array(spectrograms_original)
+        spectrograms_enhanced = np.array(spectrograms_enhanced)
+        labels = np.array(labels)
+        
+        # Save arrays
+        np.save(SPECTROGRAM_DIR / 'spectrograms_original.npy', spectrograms_original)
+        np.save(SPECTROGRAM_DIR / 'spectrograms_enhanced.npy', spectrograms_enhanced)
+        np.save(SPECTROGRAM_DIR / 'labels.npy', labels)
+        
+        # Save metadata
+        with open(SPECTROGRAM_DIR / 'metadata.json', 'w') as f:
+            json.dump({
+                'config': SPECTROGRAM_CONFIG,
+                'enhancement_params': ENHANCEMENT_PARAMS,
+                'shape': SPECTROGRAM_CONFIG['target_shape'],
+                'n_samples': processed_count,
+                'segments': metadata
+            }, f, indent=2, default=str)
+        
+        print(f"\nSaved spectrograms with shape: {spectrograms_enhanced.shape}")
+        print(f"  Original: spectrograms_original.npy")
+        print(f"  Enhanced: spectrograms_enhanced.npy (recommended for training)")
+        
+        # Print statistics
+        print(f"\nSpectrogram statistics:")
+        print(f"  Original - min: {spectrograms_original.min():.2f}, max: {spectrograms_original.max():.2f}")
+        print(f"  Enhanced - min: {spectrograms_enhanced.min():.2f}, max: {spectrograms_enhanced.max():.2f}")
     
-    # Save all variants
-    np.save(SPECTROGRAM_DIR / 'spectrograms_original.npy', spectrograms)
-    np.save(SPECTROGRAM_DIR / 'spectrograms_denoised.npy', spectrograms_denoised)
-    np.save(SPECTROGRAM_DIR / 'spectrograms_enhanced.npy', spectrograms_enhanced)
-    np.save(SPECTROGRAM_DIR / 'labels.npy', labels)
+    return spectrograms_original, spectrograms_enhanced, labels
+
+def save_example_comparison(spec_original, spec_enhanced, freqs, times, filename, idx):
+    """
+    Save comparison visualization of original vs enhanced spectrogram.
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
     
-    # Save metadata
-    with open(SPECTROGRAM_DIR / 'metadata.json', 'w') as f:
-        json.dump(metadata, f, indent=2)
+    # Common extent for both plots
+    extent = [0, SPECTROGRAM_CONFIG['target_shape'][1], 
+              0, SPECTROGRAM_CONFIG['target_shape'][0]]
     
-    # Save arrays
-    np.save(SPECTROGRAM_DIR / 'frequencies.npy', freqs_filtered)
-    np.save(SPECTROGRAM_DIR / 'times.npy', times)
+    # Original
+    im1 = axes[0].imshow(spec_original, aspect='auto', origin='lower',
+                         cmap='hot', interpolation='bilinear', extent=extent)
+    axes[0].set_title('Original Spectrogram')
+    axes[0].set_xlabel('Time bins')
+    axes[0].set_ylabel('Frequency bins')
+    plt.colorbar(im1, ax=axes[0], label='dB')
     
-    print(f"\nData saved to {SPECTROGRAM_DIR}")
+    # Enhanced
+    im2 = axes[1].imshow(spec_enhanced, aspect='auto', origin='lower',
+                         cmap='hot', interpolation='bilinear', extent=extent)
+    axes[1].set_title('Enhanced Spectrogram')
+    axes[1].set_xlabel('Time bins')
+    axes[1].set_ylabel('Frequency bins')
+    plt.colorbar(im2, ax=axes[1], label='Power')
     
-    return spectrograms, spectrograms_denoised, spectrograms_enhanced, labels
+    # Add frequency labels on the right
+    freq_labels = [0, 100, 200, 300, 400, 500]
+    freq_positions = [i * SPECTROGRAM_CONFIG['target_shape'][0] / 500 for i in freq_labels]
+    axes[1].set_yticks(freq_positions[:len(freq_labels)])
+    axes[1].set_yticklabels(freq_labels[:len(freq_labels)])
+    axes[1].yaxis.set_label_position("right")
+    axes[1].yaxis.tick_right()
+    axes[1].set_ylabel('Frequency (Hz)', rotation=270, labelpad=20)
+    
+    fig.suptitle(f'Spectrogram Comparison: {filename[:50]}...')
+    plt.tight_layout()
+    
+    examples_dir = SPECTROGRAM_DIR / "examples"
+    examples_dir.mkdir(exist_ok=True)
+    plt.savefig(examples_dir / f'comparison_{idx:03d}.png', dpi=150, bbox_inches='tight')
+    plt.close()
 
 if __name__ == "__main__":
-    print("Starting optimized spectrogram generation...")
-    print(f"Input directory: {SEGMENTS_DIR}")
+    print("=" * 60)
+    print("Focused Spectrogram Generation for Bryde's Whale Calls")
+    print("=" * 60)
+    
+    print(f"\nConfiguration:")
+    for key, value in SPECTROGRAM_CONFIG.items():
+        print(f"  {key}: {value}")
+    
+    print(f"\nProcessing segments from: {SEGMENTS_DIR}")
     print(f"Output directory: {SPECTROGRAM_DIR}")
     
-    # Process segments
-    specs_orig, specs_denoised, specs_enhanced, labels = process_all_segments()
+    # Process all segments
+    specs_orig, specs_enh, labels = process_all_segments()
     
-    # Print statistics
-    print("\n📊 Processing Statistics:")
-    if len(specs_orig) > 0:
-        print(f"  Original range: [{np.min(specs_orig):.1f}, {np.max(specs_orig):.1f}] dB")
-        print(f"  Denoised range: [{np.min(specs_denoised):.1f}, {np.max(specs_denoised):.1f}] dB")
-        print(f"  Enhanced range: [{np.min(specs_enhanced):.1f}, {np.max(specs_enhanced):.1f}] dB")
+    print("\n✓ Spectrogram generation complete!")
+    print(f"Check {SPECTROGRAM_DIR}/examples/ for visualizations")
     
-    print("\n✓ Optimized spectrogram generation complete!")
-    print("\nCheck the 'detailed_examples' folder for comprehensive analysis of sample segments.")
+    # Recommendation for autoencoder
+    print("\n" + "=" * 60)
+    print("RECOMMENDATION FOR AUTOENCODER TRAINING:")
+    print("=" * 60)
+    print("Use 'spectrograms_enhanced.npy' for training your autoencoder")
+    print("These spectrograms have:")
+    print("  - Consistent shape (129 freq bins × 64 time bins)")
+    print("  - Enhanced harmonic structure")
+    print("  - Reduced noise")
+    print("  - Normalized contrast")
+    print("\nLoad them with:")
+    print("  spectrograms = np.load('spectrograms_focused/spectrograms_enhanced.npy')")
+    print(f"  Shape: {SPECTROGRAM_CONFIG['target_shape']} per spectrogram")
