@@ -23,7 +23,7 @@ SPECTROGRAM_CONFIG = {
     'nfft': 4096,             # FFT size from paper
     'overlap': 0.95,          # 95% overlap from paper
     'freq_min': 0,            # Start from 0 Hz
-    'freq_max': 500,          # Up to 500 Hz
+    'freq_max': 350,          # Up to 500 Hz
     'target_shape': (129, 64), # Fixed output shape (freq_bins, time_bins)
     'window': 'hann',         # Window type
     'min_duration': 0.5,      # Minimum segment duration to process
@@ -281,7 +281,18 @@ def process_all_segments():
         np.save(SPECTROGRAM_DIR / 'spectrograms_original.npy', spectrograms_original)
         np.save(SPECTROGRAM_DIR / 'spectrograms_enhanced.npy', spectrograms_enhanced)
         np.save(SPECTROGRAM_DIR / 'labels.npy', labels)
-        
+
+        # Save frequency array for proper axis labeling
+        frequencies = np.linspace(SPECTROGRAM_CONFIG['freq_min'], SPECTROGRAM_CONFIG['freq_max'], SPECTROGRAM_CONFIG['target_shape'][0])
+        np.save(SPECTROGRAM_DIR / 'frequencies.npy', frequencies)
+
+        # Save time array based on typical segment duration
+        if processed_count > 0:
+            # Use average duration from metadata
+            avg_duration = np.mean([m['duration'] for m in metadata])
+            times = np.linspace(0, avg_duration, SPECTROGRAM_CONFIG['target_shape'][1])
+            np.save(SPECTROGRAM_DIR / 'times.npy', times)
+            
         # Save metadata
         with open(SPECTROGRAM_DIR / 'metadata.json', 'w') as f:
             json.dump({
@@ -330,8 +341,8 @@ def save_example_comparison(spec_original, spec_enhanced, freqs, times, filename
     plt.colorbar(im2, ax=axes[1], label='Power')
     
     # Add frequency labels on the right
-    freq_labels = [0, 100, 200, 300, 400, 500]
-    freq_positions = [i * SPECTROGRAM_CONFIG['target_shape'][0] / 500 for i in freq_labels]
+    freq_labels = [0, 50, 100, 150, 200, 250, 300, 350]
+    freq_positions = [i * SPECTROGRAM_CONFIG['target_shape'][0] / 350 for i in freq_labels]
     axes[1].set_yticks(freq_positions[:len(freq_labels)])
     axes[1].set_yticklabels(freq_labels[:len(freq_labels)])
     axes[1].yaxis.set_label_position("right")

@@ -43,7 +43,7 @@ def _safe_load(path: Path):
 def _fallback_freqs(specs):
     # If (N, 129, T), assume 0–500 Hz
     if specs.ndim == 3 and specs.shape[1] == 129:
-        return np.linspace(0, 500, 129)
+        return np.linspace(0, 350, 129)
     return None
 
 def _fallback_times(specs):

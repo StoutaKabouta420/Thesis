@@ -1,0 +1,12 @@
+{
+  "n_clusters": 4,
+  "n_neighbors": 30,
+  "pca_components": 50,
+  "silhouette_score": 0.07973505556583405,
+  "cluster_sizes": {
+    "0": 274,
+    "1": 58,
+    "2": 114,
+    "3": 249
+  }
+}
